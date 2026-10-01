@@ -1,65 +1,101 @@
-// Vercel Edge Function: keeps the Anthropic API key on the server and streams the reply back.
+// Vercel Edge Function: holds the AI key on the server and streams the reply back.
+// Switch provider with the AI_PROVIDER environment variable: "anthropic" (default) or "gemini".
+// The browser always receives Anthropic-style stream events, so index.html never changes.
 export const config = { runtime: "edge" };
 
+const PROVIDER = (process.env.AI_PROVIDER || "anthropic").toLowerCase();
 const MODELS = {
-  quick: process.env.MODEL_QUICK || "claude-haiku-4-5-20251001",
-  default: process.env.MODEL_DEFAULT || "claude-sonnet-5-5",
+  anthropic: { quick: process.env.MODEL_QUICK || "claude-haiku-4-5-20251001", default: process.env.MODEL_DEFAULT || "claude-sonnet-5-5" },
+  gemini: { quick: process.env.GEMINI_MODEL_QUICK || "gemini-3.1-flash-lite", default: process.env.GEMINI_MODEL_DEFAULT || "gemini-3.5-flash" },
 };
-const MAX_TOKENS = { quick: 4096, default: 16000 };
 
-const json = (status, obj) =>
-  new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+const json = (status, obj) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+const sse = (obj) => "event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n";
 
 export default async function handler(req) {
   if (req.method !== "POST") return json(405, { error: "POST only" });
-
   const pass = req.headers.get("x-app-passcode") || "";
   if (!process.env.APP_PASSCODE || pass !== process.env.APP_PASSCODE) return json(401, { error: "Wrong passcode" });
-  if (!process.env.ANTHROPIC_API_KEY) return json(500, { error: "ANTHROPIC_API_KEY is not set in Vercel" });
 
   let body;
   try { body = await req.json(); } catch { return json(400, { error: "Bad JSON" }); }
-  if (body.ping) return json(200, { ok: true });
+  if (body.ping) return json(200, { ok: true, provider: PROVIDER });
 
   const tier = body.tier === "quick" ? "quick" : "default";
   const messages = Array.isArray(body.messages) ? body.messages.slice(-20) : [];
   if (!messages.length || messages[messages.length - 1].role !== "user") return json(400, { error: "Last message must be from the user" });
+  const images = Array.isArray(body.images) ? body.images.slice(0, 5) : [];
 
-  // Attach images (photos / scanned pages) to the final user turn.
-  const msgs = messages.map((m, i) => {
-    if (i !== messages.length - 1 || !Array.isArray(body.images) || !body.images.length) return { role: m.role, content: String(m.content) };
-    return {
-      role: "user",
-      content: [
-        ...body.images.slice(0, 5).map((im) => ({ type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } })),
-        { type: "text", text: String(m.content) },
-      ],
-    };
-  });
+  return PROVIDER === "gemini" ? gemini(body, tier, messages, images) : anthropic(body, tier, messages, images);
+}
 
-  const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+async function anthropic(body, tier, messages, images) {
+  if (!process.env.ANTHROPIC_API_KEY) return json(500, { error: "ANTHROPIC_API_KEY is not set in Vercel" });
+  const msgs = messages.map((m, i) =>
+    i === messages.length - 1 && images.length
+      ? { role: "user", content: [...images.map((im) => ({ type: "image", source: { type: "base64", media_type: im.media_type, data: im.data } })), { type: "text", text: String(m.content) }] }
+      : { role: m.role, content: String(m.content) });
+  const up = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: {
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
+    headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({ model: MODELS.anthropic[tier], max_tokens: tier === "quick" ? 4096 : 16000, stream: true, ...(body.system ? { system: String(body.system) } : {}), messages: msgs }),
+  });
+  if (!up.ok) return upstreamError(up);
+  return new Response(up.body, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
+}
+
+async function gemini(body, tier, messages, images) {
+  if (!process.env.GEMINI_API_KEY) return json(500, { error: "GEMINI_API_KEY is not set in Vercel" });
+  const contents = messages.map((m, i) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [
+      ...(i === messages.length - 1 ? images.map((im) => ({ inlineData: { mimeType: im.media_type, data: im.data } })) : []),
+      { text: String(m.content) },
+    ],
+  }));
+  const wantsJson = !!body.system && /json/i.test(body.system);
+  const up = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODELS.gemini[tier]}:streamGenerateContent?alt=sse`, {
+    method: "POST",
+    headers: { "x-goog-api-key": process.env.GEMINI_API_KEY, "content-type": "application/json" },
     body: JSON.stringify({
-      model: MODELS[tier],
-      max_tokens: MAX_TOKENS[tier],
-      stream: true,
-      ...(body.system ? { system: String(body.system) } : {}),
-      messages: msgs,
+      contents,
+      ...(body.system ? { systemInstruction: { parts: [{ text: String(body.system) }] } } : {}),
+      generationConfig: { maxOutputTokens: tier === "quick" ? 8192 : 32768, ...(wantsJson ? { responseMimeType: "application/json" } : {}) },
     }),
   });
+  if (!up.ok) return upstreamError(up);
 
-  if (!upstream.ok) {
-    let msg = "Upstream error " + upstream.status;
-    try { msg = (await upstream.json()).error?.message || msg; } catch {}
-    return json(upstream.status === 429 || upstream.status === 529 ? 429 : upstream.status === 413 ? 413 : 502, { error: msg });
-  }
-  return new Response(upstream.body, {
-    status: 200,
-    headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+  // Translate Gemini's stream into the Anthropic-style events the page already understands.
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  let buf = "", finish = null;
+  const out = new TransformStream({
+    start(ctl) { ctl.enqueue(enc.encode(sse({ type: "message_start" }))); },
+    transform(chunk, ctl) {
+      buf += dec.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
+      let k;
+      while ((k = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, k); buf = buf.slice(k + 2);
+        const line = ev.split("\n").find((l) => l.startsWith("data:"));
+        if (!line) continue;
+        let d; try { d = JSON.parse(line.slice(5)); } catch { continue; }
+        if (d.error) { ctl.enqueue(enc.encode(sse({ type: "error", error: { type: "api_error", message: d.error.message } }))); continue; }
+        const cand = d.candidates && d.candidates[0];
+        for (const p of (cand && cand.content && cand.content.parts) || []) {
+          if (p.text && !p.thought) ctl.enqueue(enc.encode(sse({ type: "content_block_delta", delta: { type: "text_delta", text: p.text } })));
+        }
+        if (cand && cand.finishReason) finish = cand.finishReason;
+      }
+    },
+    flush(ctl) {
+      ctl.enqueue(enc.encode(sse({ type: "message_delta", delta: { stop_reason: finish === "MAX_TOKENS" ? "max_tokens" : "end_turn" } })));
+      ctl.enqueue(enc.encode(sse({ type: "message_stop" })));
+    },
   });
+  return new Response(up.body.pipeThrough(out), { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
+}
+
+async function upstreamError(up) {
+  let msg = "Upstream error " + up.status;
+  try { const e = await up.json(); msg = (e.error && e.error.message) || msg; } catch {}
+  return json(up.status === 429 || up.status === 529 ? 429 : up.status === 413 ? 413 : 502, { error: msg });
 }
