@@ -1,7 +1,6 @@
-// Vercel Edge Function: holds the AI key on the server and streams the reply back.
+// Vercel Function (web-standard Request/Response): holds the AI key on the server and streams the reply back.
 // Switch provider with the AI_PROVIDER environment variable: "anthropic" (default) or "gemini".
 // The browser always receives Anthropic-style stream events, so index.html never changes.
-export const config = { runtime: "edge" };
 
 const PROVIDER = (process.env.AI_PROVIDER || "anthropic").toLowerCase();
 const MODELS = {
@@ -12,7 +11,7 @@ const MODELS = {
 const json = (status, obj) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 const sse = (obj) => "event: " + obj.type + "\ndata: " + JSON.stringify(obj) + "\n\n";
 
-export default async function handler(req) {
+export async function POST(req) {
   if (req.method !== "POST") return json(405, { error: "POST only" });
   const pass = req.headers.get("x-app-passcode") || "";
   if (!process.env.APP_PASSCODE || pass !== process.env.APP_PASSCODE) return json(401, { error: "Wrong passcode" });
@@ -67,9 +66,10 @@ async function gemini(body, tier, messages, images) {
 
   // Translate Gemini's stream into the Anthropic-style events the page already understands.
   const enc = new TextEncoder(), dec = new TextDecoder();
-  let buf = "", finish = null;
+  let buf = "", finish = null, usage = null;
+  const model = MODELS.gemini[tier];
   const out = new TransformStream({
-    start(ctl) { ctl.enqueue(enc.encode(sse({ type: "message_start" }))); },
+    start(ctl) { ctl.enqueue(enc.encode(sse({ type: "message_start", message: { model } }))); },
     transform(chunk, ctl) {
       buf += dec.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
       let k;
@@ -84,10 +84,12 @@ async function gemini(body, tier, messages, images) {
           if (p.text && !p.thought) ctl.enqueue(enc.encode(sse({ type: "content_block_delta", delta: { type: "text_delta", text: p.text } })));
         }
         if (cand && cand.finishReason) finish = cand.finishReason;
+        if (d.usageMetadata) usage = d.usageMetadata;
       }
     },
     flush(ctl) {
-      ctl.enqueue(enc.encode(sse({ type: "message_delta", delta: { stop_reason: finish === "MAX_TOKENS" ? "max_tokens" : "end_turn" } })));
+      ctl.enqueue(enc.encode(sse({ type: "message_delta", delta: { stop_reason: finish === "MAX_TOKENS" ? "max_tokens" : "end_turn" },
+        ...(usage ? { usage: { input_tokens: usage.promptTokenCount || 0, output_tokens: (usage.candidatesTokenCount || 0) + (usage.thoughtsTokenCount || 0) } } : {}) })));
       ctl.enqueue(enc.encode(sse({ type: "message_stop" })));
     },
   });
