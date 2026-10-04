@@ -3134,7 +3134,7 @@ $("#resetBtn").onclick=()=>{ S=blankState(); save(); render(); };
    USAGE & COST TRACKING (every AI call: purpose, model, tokens, latency, estimated cost)
    ============================================================ */
 const DEFAULT_PRICES={ // USD per 1M tokens (input, output). Estimates: edit in Evals → Cost & latency.
-  "claude-haiku":[1,5],"claude-sonnet":[3,15],"claude-opus":[5,25],"gemini-3.1-flash-lite":[0.25,1.5],"gemini-3.5-flash":[1.5,9],"gemini":[1.5,9]};
+  "claude-haiku":[1,5],"claude-sonnet":[3,15],"claude-opus":[5,25],"gemini-3.1-flash-lite":[0.25,1.5],"gemini-3.5-flash":[1.5,9],"gemini":[1.5,9],"gpt-5.4-nano":[0.2,1.25],"gpt-5.4-mini":[0.75,4.5],"gpt-5.4":[2.5,15]};
 const PURPOSES=[[/intent router/i,"Intent routing"],[/RFQ drafting copilot/i,"RFQ edit (chat)"],[/Extract a structured RFQ/i,"RFQ file import"],[/procurement copilot helping a buyer draft/i,"Copilot answer"],
   [/senior procurement reviewer/i,"AI review"],[/A reviewer raised this issue/i,"Review re-check"],[/Draft an RFQ invitation/i,"Invitation draft"],[/^Pass 1 of 2/i,"Reply pass 1 (transcribe)"],
   [/Map a vendor's reply/i,"Reply pass 2 (map to RFQ)"],[/analyst behind a procurement buyer/i,"Ask: question to SQL"],[/procurement analyst answering a buyer/i,"Ask: written answer"],[/award recommendation note/i,"Award note"]];
